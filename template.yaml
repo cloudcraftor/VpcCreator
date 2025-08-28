@@ -1,0 +1,159 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: VPC Manager with async continuation, cleanup and status tracking
+
+Globals:
+  Function:
+    Runtime: python3.9
+    Timeout: 900
+    MemorySize: 512
+    Environment:
+      Variables:
+        TABLE_NAME: !Ref VPCTable
+
+Resources:
+
+  VPCTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: vpc_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: vpc_id
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  ### Cognito Auth
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: vpc-user-pool
+      AutoVerifiedAttributes: [email]
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: vpc-user-client
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ADMIN_NO_SRP_AUTH
+        - USER_PASSWORD_AUTH
+
+  ### API Gateway
+  VPCApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
+        Authorizers:
+          CognitoAuthorizer:
+            UserPoolArn: !GetAtt UserPool.Arn
+            Identity:
+              Header: Authorization
+              ReauthorizeEvery: 0
+
+  ### Lambda 1: Start VPC Creation
+  VPCManagerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: vpc_manager.lambda_handler
+      CodeUri: vpc/
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: 
+                - ec2:*
+                - dynamodb:*
+                - lambda:InvokeFunction
+              Resource: "*"
+      Environment:
+        Variables:
+          CONTINUE_LAMBDA_NAME: !Ref VPCContinueLambda
+      Events:
+        StartCreationApi:
+          Type: Api
+          Properties:
+            Path: /vpc/create
+            Method: post
+            RestApiId: !Ref VPCApi
+        StatusApi:
+          Type: Api
+          Properties:
+            Path: /vpc/status/{vpc_id}
+            Method: get
+            RestApiId: !Ref VPCApi
+
+  ### Lambda 2: Continue Setup
+  VPCContinueLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: vpc_continue.lambda_handler
+      CodeUri: vpc/
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:*
+                - dynamodb:*
+                - lambda:InvokeFunction
+              Resource: "*"
+      Environment:
+        Variables:
+          DELETE_LAMBDA_NAME: !Ref VPCDeleteLambda
+
+  ### Lambda 3: Cleanup on Failure
+  VPCDeleteLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: vpc_delete.lambda_handler
+      CodeUri: vpc/
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:*
+                - dynamodb:*
+              Resource: "*"
+
+  VPCDeleteInvokerLambda:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: vpc_delete_invoker.lambda_handler
+      CodeUri: vpc/
+      Environment:
+        Variables:
+          DELETE_LAMBDA_NAME: !Ref VPCDeleteLambda
+      Policies:
+        - AWSLambdaBasicExecutionRole
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: 
+                - lambda:InvokeFunction
+                - dynamodb:*
+              Resource: "*"
+      Events:
+        DeleteApi:
+          Type: Api
+          Properties:
+            Path: /vpc/delete/{vpc_id}
+            Method: delete
+            RestApiId: !Ref VPCApi
+
+Outputs:
+  ApiURL:
+    Value: !Sub "https://${VPCApi}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
